@@ -16,6 +16,10 @@ LOCAL_DB="USE_LOCAL_DB"
 MYSQL_DB="USE_MYSQL_DB"
 
 st.title("🗄️ SQL AI Assistant")
+st.info(
+    "💡 When deployed on Streamlit Cloud, MySQL must be hosted on a publicly accessible server. "
+    "Localhost databases are supported only when running the app locally."
+)
 st.caption(
     "Ask questions about your SQL database using natural language."
 )
