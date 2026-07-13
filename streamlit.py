@@ -1,6 +1,7 @@
 import streamlit as st
 from pathlib import Path
 from langchain_community.agent_toolkits import create_sql_agent
+from langchain_classic.agents.agent_types import AgentType
 from langchain_community.utilities import SQLDatabase
 from sqlalchemy import create_engine
 from sqlalchemy.engine import URL
@@ -15,7 +16,7 @@ st.set_page_config(
 LOCAL_DB="USE_LOCAL_DB"
 MYSQL_DB="USE_MYSQL_DB"
 
-st.title("🗄️ SQL AI Assistant")
+st.title("🗄️ SQL AI Assistant V2.0")
 st.info(
     "💡 When deployed on Streamlit Cloud, MySQL must be hosted on a publicly accessible server. "
     "Localhost databases are supported only when running the app locally."
@@ -39,7 +40,6 @@ with st.sidebar:
     model_options = [
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
-    "deepseek-r1-distill-llama-70b",
     "Custom"
     ]
 
@@ -94,6 +94,7 @@ if conversation_id not in st.session_state.chat_store:
             "content": "👋 Ask me anything about your SQL database."
         }
     ]
+    
 
 messages = st.session_state.chat_store[conversation_id]
 
@@ -125,7 +126,7 @@ def configure_db(db_uri,mysql_host=None,mysql_port=None,mysql_user=None,mysql_pa
     if db_uri == LOCAL_DB:
         dbfilepath=(Path(__file__).parent / "student.db").absolute()
         creator=lambda: sqlite3.connect(f"file:{dbfilepath}?mode=ro",uri=True)
-        return SQLDatabase(create_engine(f"sqlite:///",creator=creator))
+        return SQLDatabase(create_engine(f"sqlite:///",creator=creator), sample_rows_in_table_info=1)
         
     elif db_uri == MYSQL_DB:
         # Create a MySQL database connection
@@ -141,7 +142,7 @@ def configure_db(db_uri,mysql_host=None,mysql_port=None,mysql_user=None,mysql_pa
             database=mysql_db_name
         )
         engine = create_engine(url)
-        return SQLDatabase(engine=engine)    
+        return SQLDatabase(engine=engine, sample_rows_in_table_info=1)    
 
 current_config = {
     "db_type": db_type,
@@ -195,20 +196,140 @@ if not st.session_state.get("db_connected", False):
 if "db" in st.session_state:
 
     db = st.session_state.db
+    engine = db._engine
+    table_count = len(db.get_usable_table_names())
+    if table_count <= 20:
+        mode = "Full Schema"
+    else:
+        mode = "Table Selection"
+    st.info(
+        f"ℹ️ Database contains **{table_count}** tables. "
+        f"Using **{mode}** mode for schema understanding."
+    )
+    tables = sorted(db.get_usable_table_names())
+    if mode=="Table Selection":
+        
+        # Initialize session state
+        if "selected_tables" not in st.session_state:
+            st.session_state.selected_tables = []
 
+        search = st.text_input(
+            "🔍 Search Tables",
+            placeholder="Search table...And empty the search box to see all tables.",
+        )
+
+        # Filter visible tables
+        if search:
+            filtered_tables = [
+                table for table in tables
+                if search.lower() in table.lower()
+            ]
+        else:
+            filtered_tables = tables
+
+        # Current visible selection
+        visible_selection = st.multiselect(
+            "Select tables for the AI",
+            filtered_tables,
+            default=[
+                table
+                for table in st.session_state.selected_tables
+                if table in filtered_tables
+            ]
+        )
+
+        # Keep selections from previous searches
+        remaining = [
+            table
+            for table in st.session_state.selected_tables
+            if table not in filtered_tables
+        ]
+
+        st.session_state.selected_tables = sorted(
+            list(set(remaining + visible_selection))
+        )
+
+        st.caption(
+            f"Selected {len(st.session_state.selected_tables)} of {len(tables)} tables"
+        )
+        col1, col2 = st.columns(2)
+
+        with col1:
+            if st.button("✅ Apply Table Selection"):
+
+                if not st.session_state.selected_tables:
+                    st.warning("Please select at least one table.")
+                    st.stop()
+                
+                st.session_state.filtered_db = SQLDatabase(
+                    engine,
+                    include_tables=st.session_state.selected_tables,
+                    sample_rows_in_table_info=1
+                )
+
+                st.success("Table selection applied.")
+                st.rerun()
+
+        with col2:
+            if st.button("🗑️ Clear Selection"):
+
+                st.session_state.selected_tables = []
+
+                # Remove the filtered database
+                st.session_state.pop("filtered_db", None)
+
+                st.success("Selection cleared.")
+
+                st.rerun()
+    if mode == "Table Selection":
+        db = st.session_state.get("filtered_db")
+        with st.expander("Tables exposed to AI"):
+            st.write(st.session_state.selected_tables)
+
+        if db is None:
+            st.info("👈 Select the tables and click **Apply Table Selection**.")
+            st.stop()
+    else:
+        db = st.session_state.db
+        
     agent = create_sql_agent(
         llm=llm,
         db=db,
         handle_parsing_errors=True,
         verbose=False,
-        prefix="""
+        agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+        prefix = """
         You are an expert SQL assistant.
-        When answering:
-        - First understand the database schema.
-        - Use only information present in the database.
-        - Never invent tables, columns, or values.
-        - Explain findings in plain English.
-        - If the user asks what is in the database, summarize the tables and their columns.
+
+        Rules:
+        - Understand the database schema before answering.
+        - Use only existing tables, columns, and values.
+        - Never invent schema, relationships, or data.
+        - Explain answers in clear natural language.
+
+        This database is READ-ONLY.
+        Never generate or execute:
+        INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE, REPLACE, RENAME, GRANT, REVOKE.
+
+        Only generate SELECT queries.
+
+        SQL Guidelines:
+        - Never use SELECT *.
+        - Select only the required columns.
+        - Use LIMIT unless the user requests all rows.
+        - Use COUNT, SUM, AVG, MIN, MAX when appropriate.
+        - Generate efficient SQL.
+
+        Relationship Rules:
+        - Never assume tables are related.
+        - Join tables only when the schema clearly indicates a valid relationship.
+        - Never invent JOIN conditions.
+        - If no relationship exists, clearly state that instead of generating SQL.
+
+        Schema Questions:
+        If the question is about tables, columns, schema, primary keys, foreign keys, or relationships, answer using the schema whenever possible without executing unnecessary queries.
+
+        If the answer cannot be determined from the database, clearly say so instead of guessing.
         """
     )
 
@@ -229,6 +350,25 @@ if "db" in st.session_state:
     user_input = st.chat_input("Ask a question about your database...")
 
     if user_input:
+        dangerous_requests = [
+            "delete",
+            "drop",
+            "truncate",
+            "update",
+            "insert",
+            "alter",
+            "create table",
+            "create database",
+            "grant",
+            "revoke"
+        ]
+
+        if any(word in user_input.lower() for word in dangerous_requests):
+            st.warning(
+                "⚠️ This assistant is running in read-only mode."
+            )
+            st.stop()
+            
         messages.append({"role": "user", "content": user_input})
 
         with st.chat_message("user"):
@@ -236,16 +376,113 @@ if "db" in st.session_state:
 
         with st.chat_message("assistant"):
             with st.spinner("Generating response..."):
-                response = agent.invoke({"input": user_input})
+                try:
+                    relationship_keywords = [
+                        "relation",
+                        "relationship",
+                        "related",
+                        "schema",
+                        "structure",
+                        "foreign key",
+                        "primary key",
+                        "tables",
+                        "columns"
+                    ]
+                    
+                    if any(word in user_input.lower() for word in relationship_keywords):
 
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": response["output"]
-                    }
-                )
+                        schema = db.get_table_info()
 
-                st.markdown(response["output"])
+                        prompt = f"""
+                    You are an expert database architect.
+
+                    Database Schema:
+
+                    {schema}
+
+                    Using ONLY the schema above, answer this question:
+
+                    {user_input}
+
+                    If the question is about relationships,
+                    explain them in plain English.
+
+                    Do NOT generate SQL.
+                    """
+
+                        response = llm.invoke(prompt)
+
+                        answer = response.content
+
+                        st.markdown(answer)
+
+                        messages.append(
+                            {
+                                "role": "assistant",
+                                "content": answer
+                            }
+                        )
+
+                    else:
+
+                        response = agent.invoke(
+                            {"input": user_input}
+                        )
+
+                        answer = response["output"]
+
+                        st.markdown(answer)
+
+
+                    # Try to extract generated SQL
+                    sql_query = None
+
+                    if "intermediate_steps" in response:
+                        try:
+                            sql_query = response["intermediate_steps"][-1].tool_input
+                        except:
+                            pass
+
+                    # Validate generated SQL
+                    dangerous_sql = [
+                        "DELETE",
+                        "UPDATE",
+                        "INSERT",
+                        "DROP",
+                        "ALTER",
+                        "TRUNCATE",
+                        "CREATE",
+                        "GRANT",
+                        "REVOKE"
+                    ]
+
+                    if sql_query:
+
+                        if any(keyword in sql_query.upper() for keyword in dangerous_sql):
+                            st.error("❌ Unsafe SQL detected. Execution blocked.")
+                            st.stop()
+
+                        if "SELECT *" in sql_query.upper():
+                            st.warning(
+                                "⚠️ Generated SQL uses SELECT *. "
+                                "Consider selecting only the required columns."
+                            )
+
+                        with st.expander("📝 Generated SQL"):
+                            st.code(sql_query, language="sql")
+
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": answer
+                        }
+                    )
+                except Exception as e:
+                    st.error(str(e))
+                    # st.error(
+                    #     "The request could not be completed. "
+                    #     "Try selecting fewer tables or asking a more specific question."
+                    # )
 
 else:
     st.info("👈 Connect to a database using the sidebar to start chatting.")
